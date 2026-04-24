@@ -1,0 +1,242 @@
+import os
+# 💡 핵심 패치 1: 윈도우 환경 파이썬의 고질적인 인코딩(ASCII) 에러를 강제 차단합니다.
+os.environ["PYTHONIOENCODING"] = "utf-8"
+os.environ["PYTHONUTF8"] = "1"
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import json
+from interpret.glassbox import ExplainableBoostingRegressor
+from sklearn.linear_model import LinearRegression 
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+
+try:
+    from openai import OpenAI
+except ImportError:
+    st.error("오류: openai 라이브러리가 설치되어 있지 않습니다.")
+
+st.set_page_config(page_title="현금흐름 & 투자심의 AI", layout="wide", page_icon="⚖️")
+
+# ==========================================
+# 🔑 0. 사이드바 설정
+# ==========================================
+with st.sidebar:
+    st.header("⚙️ 분석 엔진 및 데이터 설정")
+    # 💡 핵심 패치 2: API 키 복사 시 딸려 들어오는 공백이나 줄바꿈을 .strip()으로 완벽히 제거
+    api_key_input = st.text_input("OpenAI API Key", type="password", placeholder="sk-...").strip()
+    st.divider()
+    st.info("📊 **데이터 현황**")
+    st.write("- 현금흐름표(CF): 연결됨")
+    st.write("- 손익계산서(IS): 연결됨")
+    st.warning("- **자본변동표: 미포함**")
+    st.divider()
+    macro_scenario = st.selectbox(
+        "🌍 거시경제 시나리오 선택",
+        ["고금리 및 인플레이션 지속", "경기 침체(Recession) 진입", "금리 인하 및 유동성 공급", "글로벌 공급망 위기"]
+    )
+
+st.title("⚖️ 퀀타멘탈 투자 심의 위원회 (AI Conference)")
+st.write("EBM 예측치, 주석/뉴스 분석 결과, 그리고 손익계산서를 바탕으로 4인의 AI 분석가가 투자 적합성을 끝장 토론합니다.")
+
+# ==========================================
+# 1. 데이터 로드 및 정제 함수
+# ==========================================
+@st.cache_data
+def load_and_prep_data():
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        csv_dir = os.path.join(base_dir, 'CSV')
+        
+        cf_path = os.path.join(csv_dir, 'KOSPI_CF.csv')
+        is_path = os.path.join(csv_dir, 'KOSPI_IS.csv')
+
+        if not os.path.exists(cf_path) or not os.path.exists(is_path):
+            csv_dir = os.path.join(os.getcwd(), 'CSV')
+            cf_path = os.path.join(csv_dir, 'KOSPI_CF.csv')
+            is_path = os.path.join(csv_dir, 'KOSPI_IS.csv')
+            if not os.path.exists(cf_path): return None
+            
+        cf = pd.read_csv(cf_path)
+        is_df = pd.read_csv(is_path)
+        df = pd.merge(cf, is_df, on=['회사명', '회계년도'], how='inner')
+        df.columns = df.columns.str.strip()
+        
+        def get_col(keywords):
+            for kw in keywords:
+                for col in df.columns:
+                    if kw.replace(" ", "") in col.replace(" ", ""): return col
+            return None
+
+        c_ocf = get_col(['영업활동현금흐름', '영업활동으로인한현금흐름'])
+        c_rev = get_col(['매출액', '매출'])
+        c_op = get_col(['영업이익', '영업손익']) 
+        c_ni = get_col(['당기순이익', '순이익'])
+
+        if not all([c_ocf, c_rev, c_op, c_ni]):
+            st.error("🚨 필수 재무 항목을 찾지 못했습니다.")
+            return None
+
+        def clean_finance_num(val):
+            if pd.isna(val): return np.nan
+            val_str = str(val).strip().replace(',', '')
+            if val_str in ['-', '', '0']: return 0.0 
+            try: return float(val_str)
+            except: return np.nan
+
+        for c in [c_ocf, c_rev, c_op, c_ni]:
+            df[c] = df[c].apply(clean_finance_num)
+
+        df['영업활동 현금(OCF)'] = df[c_ocf]
+        df['매출액'] = df[c_rev]
+        df['영업이익'] = df[c_op]
+        df['영업이익률(%)'] = np.where(df['매출액'] > 0, (df['영업이익'] / df['매출액']) * 100, 0)
+        df['이익의 질(OCF/NI)'] = np.where(df[c_ni] > 0, df['영업활동 현금(OCF)'] / df[c_ni], 0)
+        
+        return df.dropna(subset=['영업활동 현금(OCF)'])
+        
+    except Exception as e:
+        st.error(f"🚨 로드 에러: {e}")
+        return None
+
+def calculate_metrics(y_true, y_pred):
+    if len(y_true) < 2: return {"R2": 0, "MAPE": 0, "Acc": 0}
+    r2 = r2_score(y_true, y_pred)
+    mape = np.mean(np.abs((y_true - y_pred) / np.where(y_true==0, 1e-10, y_true))) * 100
+    acc = np.mean(np.sign(np.diff(y_true)) == np.sign(np.diff(y_pred))) * 100 if len(y_true) > 1 else 0
+    return {"R2": r2, "MAPE": mape, "Acc": acc}
+
+# ==========================================
+# 2. 투자 심의 위원회 LLM 로직
+# ==========================================
+def run_investment_committee(company, data_summary_str, api_key, scenario):
+    if not api_key: return None
+    client = OpenAI(api_key=api_key)
+    
+    agents = [
+        {"role": "리스크 관리자 (보수적)", "icon": "🛡️", "prompt": "부채, 우발채무, 현금흐름의 질을 근거로 비판적 시각에서 리스크를 지적하세요."},
+        {"role": "성장 분석가 (공격적)", "icon": "🚀", "prompt": "매출 성장성, 뉴스 모멘텀, 산업의 기회를 근거로 투자 가치를 옹호하세요."},
+        {"role": "계량 분석가 (퀀트)", "icon": "🔢", "prompt": "ML 모델 지표, IS 마진율, 수치적 상관관계의 신뢰성을 엄격히 따지세요."}
+    ]
+    debate_log = []
+    
+    for agent in agents:
+        prompt = f"""
+        당신은 투자 심의 위원회의 {agent['role']}입니다. 
+        대상 기업: {company} | 거시경제 상황: {scenario}
+        데이터 요약: {data_summary_str}
+        
+        미션: {agent['prompt']}
+        친근한 한국어 해요체로 3~4문장으로 발언하세요. JSON 형식으로 반환:
+        {{ "comment": "발언 내용" }}
+        """
+        try:
+            response = client.chat.completions.create(model="gpt-3.5-turbo", messages=[{"role": "user", "content": prompt}], response_format={"type": "json_object"})
+            comment = json.loads(response.choices[0].message.content)['comment']
+        except Exception as e:
+            comment = f"분석 오류 발생: {e}"
+        debate_log.append({"role": agent['role'], "icon": agent['icon'], "content": comment})
+
+    prompt_chair = f"""
+    당신은 투자 심의 위원회의 의장입니다. 아래 분석가들의 토론 내용을 바탕으로 {company}에 대한 최종 투자의견을 결정하세요.
+    토론 내용: {debate_log}
+    거시경제 상황: {scenario}
+    
+    JSON 형식으로만 반환:
+    {{
+        "decision": "Strong Buy / Buy / Hold / Sell 중 선택",
+        "synthesis": "토론을 요약하고 내린 최종 결론 (해요체 4문장)",
+        "score": 0~100 (투자 매력도 점수)
+    }}
+    """
+    try:
+        res_chair = json.loads(client.chat.completions.create(model="gpt-3.5-turbo", messages=[{"role": "user", "content": prompt_chair}], response_format={"type": "json_object"}).choices[0].message.content)
+    except:
+        res_chair = {"decision": "Error", "synthesis": "최종 의견을 도출하지 못했습니다.", "score": 0}
+        
+    return {"debate": debate_log, "final": res_chair}
+
+# ==========================================
+# 🚀 3. 메인 화면 구성
+# ==========================================
+df = load_and_prep_data()
+
+if df is not None and not df.empty:
+    selected_corp = st.selectbox("🎯 분석할 기업을 선택하세요", df['회사명'].unique())
+    corp_data = df[df['회사명'] == selected_corp].sort_values('회계년도')
+    
+    st.divider()
+    st.subheader("📊 1. AI 현금흐름 및 수익성 예측")
+    
+    if len(corp_data) < 2:
+        st.warning("⚠️ 해당 기업은 과거 데이터가 부족하여 AI 예측 모델을 구동할 수 없습니다. (최소 2개년 데이터 필요)")
+    else:
+        corp_data = corp_data.tail(4) 
+        feat = '영업활동 현금(OCF)'
+        X = np.arange(len(corp_data)).reshape(-1, 1)
+        y = corp_data[feat].values
+        
+        try:
+            model = ExplainableBoostingRegressor(interactions=0, validation_size=0).fit(X, y)
+            model_name = "EBM"
+        except Exception:
+            model = LinearRegression().fit(X, y)
+            model_name = "선형회귀(대체)"
+            st.toast("⚠️ 데이터 부족으로 EBM 대신 선형 회귀 모델이 적용되었습니다.", icon="🔧")
+            
+        y_pred = model.predict(X)
+        metrics = calculate_metrics(y, y_pred) 
+        future_val = model.predict([[len(corp_data)]])[0]
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=corp_data['회계년도'], y=y, mode='lines+markers', name="실적"))
+        fig.add_trace(go.Scatter(x=[corp_data['회계년도'].iloc[-1], "AI 예측"], y=[y[-1], future_val], mode='lines+markers', line=dict(dash='dash'), name=f"예측 ({model_name})"))
+        st.plotly_chart(fig, use_container_width=True)
+        st.write(f"📈 **모델 신뢰도(R²):** {metrics['R2']:.2f} | **방향 적중률:** {metrics['Acc']:.1f}%")
+
+        # 투자 심의 컨퍼런스 실행
+        st.divider()
+        st.subheader(f"🏛️ 2. {selected_corp} 투자 심의 위원회 회의록")
+
+        if st.button("🎙️ 가상 투자 심의 컨퍼런스 시작", type="primary", use_container_width=True):
+            
+            # 💡 핵심 패치 3: Numpy 타입의 숫자들을 순수 Python float로 변환하여 에러 원천 차단
+            safe_data_summary = {
+                "current_ocf": float(y[-1]),
+                "margin_trend": [float(x) for x in corp_data['영업이익률(%)'].tolist()],
+                "quality_of_earnings": float(corp_data['이익의 질(OCF/NI)'].iloc[-1]),
+                "ai_prediction": float(future_val),
+                "ai_r2": float(metrics['R2'])
+            }
+            # 데이터를 안전한 JSON 문자열로 미리 포장합니다.
+            safe_data_str = json.dumps(safe_data_summary, ensure_ascii=False)
+            
+            with st.status("👨‍💼 분석가들이 데이터를 검토 중입니다...", expanded=True) as status:
+                results = run_investment_committee(selected_corp, safe_data_str, api_key_input, macro_scenario)
+                if results:
+                    status.update(label="✅ 끝장 토론 종료! 판결이 준비되었습니다.", state="complete", expanded=False)
+                    for chat in results['debate']:
+                        with st.chat_message(chat['role'], avatar=chat['icon']):
+                            st.write(f"**{chat['role']}**")
+                            st.write(chat['content'])
+                    
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    with st.chat_message("의장", avatar="⚖️"):
+                        st.error(f"### 📢 최종 심의 결과: {results['final']['decision']}")
+                        st.write(results['final']['synthesis'])
+                        st.metric("종합 매력도 점수", f"{results['final']['score']} / 100")
+                else:
+                    status.update(label="⚠️ API 키를 입력해 주세요.", state="error")
+
+    # CSV 데이터 표시
+    st.divider()
+    st.markdown("### 🔗 참조 데이터 및 리포트")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.info("📂 **손익계산서(IS) Raw Data**")
+        st.dataframe(corp_data[['회계년도', '매출액', '영업이익', '영업이익률(%)']] if len(corp_data) > 0 else df.head(), hide_index=True)
+    with c2:
+        st.info("📑 **자본변동표**")
+        st.warning("⚠️ **자본변동표 데이터 미포함**")
+        st.write("해당 기업의 자본변동 데이터는 현재 시스템에 적재되지 않았습니다.")
