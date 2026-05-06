@@ -1,0 +1,116 @@
+# 현재 환경에 필요한 라이브러리 설치
+!pip install -U agno google-generativeai pandas
+!pip install -U agno google-generativeai pandas duckdb sqlalchemy
+!pip install -U agno openai pandas duckdb sqlalchemy
+!pip install -U agno openai duckduckgo-search
+!pip install -U agno openai requests
+!pip install ddgs
+
+# 1-2. 라이브러리 Import (공식 문서 교차 검증 완료)
+import os
+import json
+import requests
+import pandas as pd
+
+from agno.agent import Agent
+from agno.models.openai import OpenAIChat
+from agno.tools.csv_toolkit import CsvTools
+from agno.tools.duckduckgo import DuckDuckGoTools
+
+# 2-1. OpenAI API 키 설정 (보유하신 sk-... 키로 변경해주세요)
+os.environ["OPENAI_API_KEY"] = "APIKEY_입력"
+
+# [네이버 API 키] - 네이버 개발자 센터 발급
+NAVER_CLIENT_ID = "qWSoA6MMbstZBgEw56a3"
+NAVER_CLIENT_SECRET = "QlN5TE0qGQ"
+
+# [구글 API 키] - Google Cloud Console 및 Programmable Search 발급
+GOOGLE_API_KEY = "YOUR_GOOGLE_API_KEY"
+GOOGLE_CX = "9043bf6e3356745e9" # 예: DART만 검색하도록 설정된 Search Engine ID
+
+# 2-2. 강력한 통합 검색 도구 정의
+def search_integrated_risk(company_name: str, keyword: str) -> str:
+    """
+    주어진 기업과 리스크 키워드에 대해 네이버(뉴스)와 구글(DART 공시)을 동시 검색합니다.
+    """
+    search_query = f"{company_name} {keyword}"
+    combined_results = []
+
+    # 1. 네이버 뉴스 검색 (한국어 자연어 이슈 탐지)
+    try:
+        naver_url = "https://openapi.naver.com/v1/search/news.json"
+        naver_headers = {
+            "X-Naver-Client-Id": NAVER_CLIENT_ID,
+            "X-Naver-Client-Secret": NAVER_CLIENT_SECRET
+        }
+        naver_params = {"query": search_query, "display": 3, "sort": "date"} # 최신순 3개
+        naver_res = requests.get(naver_url, headers=naver_headers, params=naver_params)
+
+        if naver_res.status_code == 200:
+            n_items = naver_res.json().get('items', [])
+            if n_items:
+                combined_results.append("=== [Naver News] ===")
+                for item in n_items:
+                    # HTML 태그 제거 및 정리
+                    title = item['title'].replace('<b>', '').replace('</b>', '').replace('&quot;', '')
+                    combined_results.append(f"- 제목: {title}")
+    except Exception as e:
+        combined_results.append(f"네이버 검색 오류: {str(e)}")
+
+    # 2. 구글 DART 공시 검색 (site:dart.fss.or.kr 제한 쿼리)
+    try:
+        google_url = "https://www.googleapis.com/customsearch/v1"
+        google_params = {
+            "key": GOOGLE_API_KEY,
+            "cx": GOOGLE_CX,
+            "q": f"{search_query} site:dart.fss.or.kr",
+            "num": 3
+        }
+        google_res = requests.get(google_url, params=google_params)
+
+        if google_res.status_code == 200:
+            g_items = google_res.json().get('items', [])
+            if g_items:
+                combined_results.append("\n=== [Google DART Search] ===")
+                for item in g_items:
+                    combined_results.append(f"- 공시제목: {item['title']}")
+                    combined_results.append(f"  요약: {item['snippet']}")
+    except Exception as e:
+        combined_results.append(f"구글 검색 오류: {str(e)}")
+
+    # 3. 결과 종합
+    if not combined_results:
+        return f"'{search_query}'에 대한 최근 뉴스 및 공시 검색 결과가 없습니다. (해당 리스크 없음)"
+
+    return "\n".join(combined_results)
+
+# 3-1. 리서치 에이전트 생성
+research_agent = Agent(
+    name="Risk_Research_Pro",
+    role="기업의 숨겨진 비재무적 리스크(블랙스완)와 공시 위반 사례를 추적하는 전문 리서치 애널리스트",
+    model=OpenAIChat(id="gpt-4o"),
+
+    # 💡 통합된 단일 커스텀 도구만 장착
+    tools=[search_integrated_risk],
+
+    instructions=[
+        "당신은 주어진 기업의 치명적인 '비재무적 리스크'를 찾기 위해 통합 검색 도구를 사용하는 역할을 맡습니다.",
+        "제공된 `search_integrated_risk` 도구를 사용하여 다음 원칙을 준수하세요:",
+        "  1. [블랙스완 탐지]: 도구를 호출할 때 `company_name`과 함께 `keyword` 파라미터에 '소송', '횡령', '배임', '우발부채' 등을 개별적으로 넣어 여러 번 탐색하세요.",
+        "  2. [노이즈 및 중복 차단]: 반환된 데이터 중 네이버 뉴스와 구글 DART 내용이 동일한 사건을 가리킨다면, 하나로 병합하여 요약하세요. 주가 전망이나 단순 실적 기사는 무시하세요.",
+        "  3. [결과 해석]: 검색 결과가 없다면 무리하게 지어내지 말고 '해당 리스크 없음'으로 명확히 간주하세요.",
+        "",
+        "분석 후 [검색된 핵심 리스크 요약] - [공시(DART) 기반 팩트체크] - [신용도 예상 타격] 구조로 마크다운 보고서를 작성하세요."
+    ],
+    markdown=True
+)
+
+# 3-2. 실행 테스트
+company_name = "삼성전자"
+
+query = (
+    f"'{company_name}'에 대한 최신 비재무적 리스크(소송, 배임, 우발부채 등)를 꼼꼼하게 검색하고 종합 평가해주세요."
+)
+
+print(f"🕵️‍♂️ '{company_name}' 듀얼 엔진(Naver+Google) 리스크 크롤링을 시작합니다...\n" + "="*50)
+research_agent.print_response(query, stream=True)
